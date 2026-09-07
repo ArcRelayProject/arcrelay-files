@@ -5,6 +5,8 @@ mod directory_snapshots;
 use directory_snapshots::{natural_folded_cmp, DirectorySnapshots};
 mod directory_query;
 use directory_query::DirectoryQueries;
+mod system_folder;
+pub use system_folder::{FileStat, MAX_FILE_RANGE_BYTES};
 
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
@@ -316,6 +318,7 @@ pub struct FileShareService {
     shares: Arc<RwLock<Vec<SharedDirectory>>>,
     directory_snapshots: Arc<std::sync::Mutex<DirectorySnapshots>>,
     directory_queries: Arc<DirectoryQueries>,
+    mutations: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl FileShareService {
@@ -349,6 +352,7 @@ impl FileShareService {
             shares: Arc::new(RwLock::new(shares)),
             directory_snapshots: Arc::new(std::sync::Mutex::new(DirectorySnapshots::default())),
             directory_queries: Arc::new(DirectoryQueries::default()),
+            mutations: Arc::new(tokio::sync::Mutex::new(())),
         });
         service.persist()?;
         Ok(service)
@@ -734,6 +738,7 @@ impl FileShareService {
         relative_path: &str,
         name: &str,
     ) -> Result<FileEntry> {
+        let _guard = self.mutations.lock().await;
         validate_name(name)?;
         let share = self.shared_directory(share_id)?;
         ensure_writable(&share)?;
@@ -765,6 +770,7 @@ impl FileShareService {
         relative_path: &str,
         new_name: &str,
     ) -> Result<FileEntry> {
+        let _guard = self.mutations.lock().await;
         validate_name(new_name)?;
         let share = self.shared_directory(share_id)?;
         ensure_writable(&share)?;
@@ -801,6 +807,7 @@ impl FileShareService {
     }
 
     pub async fn delete(&self, share_id: &str, relative_path: &str) -> Result<()> {
+        let _guard = self.mutations.lock().await;
         let share = self.shared_directory(share_id)?;
         ensure_writable(&share)?;
         let path = resolve_existing(&share, relative_path)?;
