@@ -6,6 +6,7 @@ use directory_snapshots::{natural_folded_cmp, DirectorySnapshots};
 mod directory_query;
 use directory_query::DirectoryQueries;
 mod system_folder;
+mod thumbnails;
 pub use system_folder::{FileStat, MAX_FILE_RANGE_BYTES};
 
 use std::ffi::OsStr;
@@ -17,7 +18,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
-use image::ImageEncoder as _;
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 
@@ -91,8 +91,8 @@ pub const DEFAULT_DIRECTORY_PAGE_SIZE: usize = 100;
 pub const MAX_DIRECTORY_PAGE_SIZE: usize = 500;
 pub const MAX_TEXT_PREVIEW_BYTES: usize = 1024 * 1024;
 const MAX_REMOTE_UPLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-const MAX_THUMBNAIL_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_THUMBNAIL_DIMENSION: u32 = 4096;
+pub(crate) const MAX_THUMBNAIL_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_THUMBNAIL_DIMENSION: u32 = 4096;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
@@ -319,10 +319,25 @@ pub struct FileShareService {
     directory_snapshots: Arc<std::sync::Mutex<DirectorySnapshots>>,
     directory_queries: Arc<DirectoryQueries>,
     mutations: Arc<tokio::sync::Mutex<()>>,
+    io_slots: Arc<tokio::sync::Semaphore>,
+    resources: Arc<arcrelay_content::ContentResources>,
+    thumbnails: Arc<std::sync::Mutex<thumbnails::ThumbnailCache>>,
 }
 
 impl FileShareService {
     pub fn load(config_directory: &Path) -> std::io::Result<Arc<Self>> {
+        Self::load_with_resources(
+            config_directory,
+            Arc::new(arcrelay_content::ContentResources::default()),
+        )
+    }
+
+    /// Share content admission with the installation's other capabilities.
+    /// Construction performs no Tokio work; admission occurs on first async use.
+    pub fn load_with_resources(
+        config_directory: &Path,
+        resources: Arc<arcrelay_content::ContentResources>,
+    ) -> std::io::Result<Arc<Self>> {
         std::fs::create_dir_all(config_directory)?;
         let config_directory = config_directory.canonicalize()?;
         let config_path = config_directory.join("remote-file-shares.json");
@@ -353,6 +368,9 @@ impl FileShareService {
             directory_snapshots: Arc::new(std::sync::Mutex::new(DirectorySnapshots::default())),
             directory_queries: Arc::new(DirectoryQueries::default()),
             mutations: Arc::new(tokio::sync::Mutex::new(())),
+            io_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            resources,
+            thumbnails: Arc::new(std::sync::Mutex::new(thumbnails::ThumbnailCache::default())),
         });
         service.persist()?;
         Ok(service)
@@ -648,6 +666,40 @@ impl FileShareService {
             .insert(query, path, entries, limit)
     }
 
+    async fn filesystem<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let permit = self
+            .io_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| FileError::Unavailable(error.to_string()))?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        })
+        .await?
+    }
+
+    async fn resolve_path(
+        &self,
+        share: SharedDirectory,
+        relative: &str,
+        web: bool,
+    ) -> Result<PathBuf> {
+        let relative = relative.to_owned();
+        self.filesystem(move || {
+            if web {
+                resolve_web_existing(&share, &relative)
+            } else {
+                resolve_existing(&share, &relative)
+            }
+        })
+        .await
+    }
+
     pub async fn prepare_file(
         &self,
         share_id: &str,
@@ -655,11 +707,7 @@ impl FileShareService {
         web: bool,
     ) -> Result<PreparedFile> {
         let share = self.shared_directory(share_id)?;
-        let path = if web {
-            resolve_web_existing(&share, relative_path)?
-        } else {
-            resolve_existing(&share, relative_path)?
-        };
+        let path = self.resolve_path(share, relative_path, web).await?;
         let metadata = tokio::fs::metadata(&path)
             .await
             .map_err(|error| FileError::io("failed to read file metadata", error))?;
@@ -714,24 +762,6 @@ impl FileShareService {
         })
     }
 
-    pub async fn prepare_thumbnail(
-        &self,
-        share_id: &str,
-        relative_path: &str,
-        max_dimension: u32,
-        web: bool,
-    ) -> Result<Option<ImageThumbnail>> {
-        let prepared = self.prepare_file(share_id, relative_path, web).await?;
-        if prepared.entry.size > MAX_THUMBNAIL_SOURCE_BYTES
-            || prepared.entry.preview_kind != PreviewKind::Image
-        {
-            return Ok(None);
-        }
-        let dimension = max_dimension.clamp(32, MAX_THUMBNAIL_DIMENSION);
-        tokio::task::spawn_blocking(move || build_image_thumbnail(&prepared.path, dimension))
-            .await?
-    }
-
     pub async fn create_directory(
         &self,
         share_id: &str,
@@ -742,13 +772,22 @@ impl FileShareService {
         validate_name(name)?;
         let share = self.shared_directory(share_id)?;
         ensure_writable(&share)?;
-        let parent = resolve_existing(&share, relative_path)?;
-        if !parent.is_dir() {
+        let parent = self
+            .resolve_path(share.clone(), relative_path, false)
+            .await?;
+        if !tokio::fs::metadata(&parent)
+            .await
+            .map_err(|error| FileError::io("failed to read parent directory metadata", error))?
+            .is_dir()
+        {
             return Err(FileError::Invalid("target is not a directory".into()));
         }
-        ensure_directory_accepts_writes(&parent)?;
+        ensure_directory_accepts_writes(&parent).await?;
         let path = parent.join(name);
-        if !path.exists() {
+        if !tokio::fs::try_exists(&path)
+            .await
+            .map_err(|error| FileError::io("failed to check item availability", error))?
+        {
             tokio::fs::create_dir(&path)
                 .await
                 .map_err(|error| describe_write_error("create directory", error))?;
@@ -774,7 +813,9 @@ impl FileShareService {
         validate_name(new_name)?;
         let share = self.shared_directory(share_id)?;
         ensure_writable(&share)?;
-        let source = resolve_existing(&share, relative_path)?;
+        let source = self
+            .resolve_path(share.clone(), relative_path, false)
+            .await?;
         if source == share.path {
             return Err(FileError::Invalid(
                 "the shared root directory cannot be renamed".into(),
@@ -784,7 +825,10 @@ impl FileShareService {
             .parent()
             .ok_or_else(|| FileError::Invalid("invalid path".into()))?;
         let destination = parent.join(new_name);
-        if destination.exists() {
+        if tokio::fs::try_exists(&destination)
+            .await
+            .map_err(|error| FileError::io("failed to check destination availability", error))?
+        {
             return Err(FileError::Conflict(
                 "an item with the same name already exists".into(),
             ));
@@ -810,13 +854,19 @@ impl FileShareService {
         let _guard = self.mutations.lock().await;
         let share = self.shared_directory(share_id)?;
         ensure_writable(&share)?;
-        let path = resolve_existing(&share, relative_path)?;
+        let path = self
+            .resolve_path(share.clone(), relative_path, false)
+            .await?;
         if path == share.path {
             return Err(FileError::Invalid(
                 "the shared root directory cannot be deleted".into(),
             ));
         }
-        if path.is_dir() {
+        if tokio::fs::metadata(&path)
+            .await
+            .map_err(|error| FileError::io("failed to read item metadata", error))?
+            .is_dir()
+        {
             tokio::fs::remove_dir_all(path)
                 .await
                 .map_err(|error| FileError::io("failed to delete directory", error))
@@ -839,33 +889,54 @@ impl FileShareService {
         validate_name(name)?;
         let share = self.shared_directory(share_id)?;
         ensure_writable(&share)?;
-        let parent = resolve_existing(&share, relative_path)?;
-        if !parent.is_dir() {
+        let parent = self
+            .resolve_path(share.clone(), relative_path, false)
+            .await?;
+        if !tokio::fs::metadata(&parent)
+            .await
+            .map_err(|error| FileError::io("failed to read parent directory metadata", error))?
+            .is_dir()
+        {
             return Err(FileError::Invalid(
                 "upload target is not a directory".into(),
             ));
         }
-        ensure_directory_accepts_writes(&parent)?;
+        ensure_directory_accepts_writes(&parent).await?;
         if size > MAX_REMOTE_UPLOAD_BYTES {
             return Err(FileError::FileTooLarge(
                 "a remote upload cannot exceed 4 GiB per file".into(),
             ));
         }
         if size
-            > fs2::available_space(&parent)
-                .map_err(|error| FileError::io("failed to query available disk space", error))?
+            > self
+                .filesystem({
+                    let parent = parent.clone();
+                    move || {
+                        fs2::available_space(&parent).map_err(|error| {
+                            FileError::io("failed to query available disk space", error)
+                        })
+                    }
+                })
+                .await?
         {
             return Err(FileError::InsufficientStorage(
                 "insufficient disk space".into(),
             ));
         }
         let destination = parent.join(name);
-        if destination.is_dir() {
+        if tokio::fs::metadata(&destination)
+            .await
+            .is_ok_and(|meta| meta.is_dir())
+        {
             return Err(FileError::Conflict(
                 "a directory with the same name already exists at the destination".into(),
             ));
         }
-        if destination.exists() && !overwrite {
+        if tokio::fs::try_exists(&destination)
+            .await
+            .map_err(|error| FileError::io("failed to check destination availability", error))?
+            && !overwrite
+        {
             return Err(FileError::Conflict(
                 "the destination file already exists".into(),
             ));
@@ -1214,8 +1285,9 @@ fn ensure_writable(share: &SharedDirectory) -> Result<()> {
     }
 }
 
-fn ensure_directory_accepts_writes(directory: &Path) -> Result<()> {
-    let metadata = std::fs::metadata(directory)
+async fn ensure_directory_accepts_writes(directory: &Path) -> Result<()> {
+    let metadata = tokio::fs::metadata(directory)
+        .await
         .map_err(|error| FileError::io("failed to read target directory metadata", error))?;
     if metadata.permissions().readonly() {
         Err(FileError::PermissionDenied(
@@ -1436,25 +1508,6 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
-}
-
-fn build_image_thumbnail(path: &Path, max_dimension: u32) -> Result<Option<ImageThumbnail>> {
-    let image = match image::open(path) {
-        Ok(image) => image,
-        Err(_) => return Ok(None),
-    };
-    let thumbnail = image.thumbnail(max_dimension, max_dimension).to_rgba8();
-    let mut bytes = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut bytes).write_image(
-        thumbnail.as_raw(),
-        thumbnail.width(),
-        thumbnail.height(),
-        image::ExtendedColorType::Rgba8,
-    )?;
-    Ok(Some(ImageThumbnail {
-        bytes,
-        media_type: "image/png".into(),
-    }))
 }
 
 #[cfg(test)]
