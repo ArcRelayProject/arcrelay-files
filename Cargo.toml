@@ -6,7 +6,7 @@ license = "AGPL-3.0-only"
 publish = false
 
 [dependencies]
-arcrelay-content = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-content.git", rev = "85c59c2358c712b488faef36c9a5c4ff36b4d129" }
+arcrelay-content = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-content.git", rev = "b4b24071b70b4a81e239fb6ae76ca3ac204a4d21" }
 ts-rs = { version = "12", features = ["serde-json-impl", "chrono-impl", "uuid-impl", "no-serde-warnings"] }
 argon2 = { version = "0.5", features = ["std"] }
 fs2 = "0.4"
