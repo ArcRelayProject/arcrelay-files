@@ -11,7 +11,7 @@ pub struct FileStat {
     pub revision: String,
 }
 
-fn revision(metadata: &std::fs::Metadata) -> String {
+pub(crate) fn revision(metadata: &std::fs::Metadata) -> String {
     let mut hash = Sha256::new();
     hash.update(metadata.len().to_le_bytes());
     for time in [metadata.modified(), metadata.created()] {
@@ -32,6 +32,74 @@ fn revision(metadata: &std::fs::Metadata) -> String {
         hash.update(metadata.ctime_nsec().to_le_bytes());
     }
     format!("{:x}", hash.finalize())
+}
+
+/// Stable across a rename on the same volume. Creation time guards against
+/// an inode/file-index being reused after deletion.
+pub(crate) fn identity(metadata: &std::fs::Metadata, absolute: &Path, relative: &str) -> String {
+    let mut hash = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        hash.update(metadata.dev().to_le_bytes());
+        hash.update(metadata.ino().to_le_bytes());
+        if metadata.nlink() > 1 {
+            hash.update(relative.as_bytes());
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+            Storage::FileSystem::{
+                CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+                FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+            },
+        };
+        let wide: Vec<u16> = absolute.as_os_str().encode_wide().chain(Some(0)).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE {
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            let ok = unsafe { GetFileInformationByHandle(handle, &mut info) } != 0;
+            unsafe { CloseHandle(handle) };
+            if ok {
+                hash.update(info.dwVolumeSerialNumber.to_le_bytes());
+                hash.update(info.nFileIndexHigh.to_le_bytes());
+                hash.update(info.nFileIndexLow.to_le_bytes());
+                if info.nNumberOfLinks > 1 {
+                    hash.update(relative.as_bytes());
+                }
+            } else {
+                hash.update(relative.as_bytes());
+            }
+        } else {
+            hash.update(relative.as_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    hash.update(relative.as_bytes());
+    // Some filesystems do not expose birth time; in that case the volume and
+    // inode/file-index are still more stable than a path-derived identifier.
+    if let Ok(created) = metadata.created().and_then(|time| {
+        time.duration_since(UNIX_EPOCH)
+            .map_err(std::io::Error::other)
+    }) {
+        hash.update(created.as_nanos().to_le_bytes());
+    }
+    let _ = absolute;
+    format!("f{:x}", hash.finalize())
 }
 
 fn existing(share: &SharedDirectory, relative: &str) -> Result<PathBuf> {
@@ -312,6 +380,20 @@ mod tests {
     #[test]
     fn system_folder_service_constructs_without_runtime() {
         let _ = setup();
+    }
+
+    #[tokio::test]
+    async fn identity_survives_rename_and_changes_on_replacement() {
+        let (_temp, service, id, root) = setup();
+        std::fs::write(root.join("first"), b"one").unwrap();
+        let first = service.stat(&id, "first").await.unwrap().entry.id;
+        std::fs::rename(root.join("first"), root.join("second")).unwrap();
+        let moved = service.stat(&id, "second").await.unwrap().entry.id;
+        assert_eq!(first, moved);
+        std::fs::remove_file(root.join("second")).unwrap();
+        std::fs::write(root.join("second"), b"two").unwrap();
+        let replaced = service.stat(&id, "second").await.unwrap().entry.id;
+        assert_ne!(first, replaced);
     }
 
     #[tokio::test]

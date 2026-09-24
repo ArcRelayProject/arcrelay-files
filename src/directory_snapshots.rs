@@ -149,11 +149,13 @@ mod tests {
     use crate::{FileKind, PreviewKind};
     fn entry(name: &str) -> FileEntry {
         FileEntry {
+            id: name.into(),
             name: name.into(),
             relative_path: name.into(),
             kind: FileKind::File,
             size: 0,
             modified_at_ms: 0,
+            revision: String::new(),
             media_type: String::new(),
             preview_kind: PreviewKind::None,
         }
