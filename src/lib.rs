@@ -3,6 +3,7 @@
 
 mod directory_snapshots;
 use directory_snapshots::{natural_folded_cmp, DirectorySnapshots};
+mod change_feed;
 mod directory_query;
 use directory_query::DirectoryQueries;
 mod system_folder;
@@ -243,11 +244,14 @@ pub enum DirectorySortKey {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEntry {
+    pub id: String,
     pub name: String,
     pub relative_path: String,
     pub kind: FileKind,
     pub size: u64,
     pub modified_at_ms: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub revision: String,
     pub media_type: String,
     pub preview_kind: PreviewKind,
 }
@@ -322,6 +326,8 @@ pub struct FileShareService {
     io_slots: Arc<tokio::sync::Semaphore>,
     resources: Arc<arcrelay_content::ContentResources>,
     thumbnails: Arc<std::sync::Mutex<thumbnails::ThumbnailCache>>,
+    change_feeds:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<change_feed::ChangeFeed>>>>,
 }
 
 impl FileShareService {
@@ -371,6 +377,7 @@ impl FileShareService {
             io_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             resources,
             thumbnails: Arc::new(std::sync::Mutex::new(thumbnails::ThumbnailCache::default())),
+            change_feeds: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         });
         service.persist()?;
         Ok(service)
@@ -455,6 +462,9 @@ impl FileShareService {
             return Err(FileError::NotFound("shared directory".into()));
         }
         drop(shares);
+        if let Some(feed) = self.change_feeds.lock().unwrap().remove(id) {
+            feed.invalidate();
+        }
         self.persist()
             .map_err(|error| FileError::io("failed to persist shared directories", error))
     }
@@ -468,6 +478,9 @@ impl FileShareService {
         share.paired_device_writable = writable;
         let view = local_share(share);
         drop(shares);
+        if let Some(feed) = self.change_feeds.lock().unwrap().get(id) {
+            feed.invalidate();
+        }
         self.persist()
             .map_err(|error| FileError::io("failed to persist shared directories", error))?;
         Ok(view)
@@ -962,11 +975,13 @@ impl FileShareService {
             overwrite,
             expected_modified_at_ms,
             entry: FileEntry {
+                id: String::new(),
                 name: name.to_string(),
                 relative_path: join_remote_path(relative_path, name),
                 kind: FileKind::File,
                 size,
                 modified_at_ms: now_ms(),
+                revision: String::new(),
                 media_type: media_type_for_path(&destination),
                 preview_kind: preview_kind_for_path(&destination),
             },
@@ -1321,6 +1336,7 @@ fn entry_from_metadata(
         FileKind::File
     };
     FileEntry {
+        id: system_folder::identity(metadata, path, &relative_path),
         name,
         relative_path,
         kind,
@@ -1330,6 +1346,7 @@ fn entry_from_metadata(
             0
         },
         modified_at_ms: metadata_modified_at_ms(metadata),
+        revision: system_folder::revision(metadata),
         media_type: if metadata.is_file() {
             media_type_for_path(path)
         } else {
